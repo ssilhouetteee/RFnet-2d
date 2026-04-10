@@ -1,0 +1,253 @@
+import os
+import torch
+from torch.utils.data import Dataset
+
+from .rand import Uniform
+from .transforms import Rot90, Flip, Identity, Compose
+from .transforms import GaussianBlur, Noise, Normalize, RandSelect
+from .transforms import RandCrop, CenterCrop, Pad,RandCrop3D,RandomRotion,RandomFlip,RandomIntensityChange
+from .transforms import NumpyType
+from .data_utils import pkload
+
+import numpy as np
+import nibabel as nib
+
+HGG = []
+LGG = []
+for i in range(0, 260):
+    HGG.append(str(i).zfill(3))
+for i in range(336, 370):
+    HGG.append(str(i).zfill(3))
+for i in range(260, 336):
+    LGG.append(str(i).zfill(3))
+
+mask_array = np.array([[True, False, False, False], [False, True, False, False], [False, False, True, False], [False, False, False, True],
+                      [True, True, False, False], [True, False, True, False], [True, False, False, True], [False, True, True, False], [False, True, False, True], [False, False, True, True], [True, True, True, False], [True, True, False, True], [True, False, True, True], [False, True, True, True],
+                      [True, True, True, True]])
+
+class Brats_loadall_nii(Dataset):
+    def __init__(self, transforms='', root=None, modal='all', num_cls=4, train_file='train.txt'):
+        data_file_path = os.path.join(root, train_file)
+        with open(data_file_path, 'r') as f:
+            datalist = [i.strip() for i in f.readlines()]
+        datalist.sort()
+
+        volpaths = []
+        for dataname in datalist:
+            volpaths.append(os.path.join(root, 'vol', dataname+'_vol.npy'))
+
+        self.volpaths = volpaths
+        self.transforms = eval(transforms or 'Identity()')
+        self.names = datalist
+        self.num_cls = num_cls
+        if modal == 'flair':
+            self.modal_ind = np.array([0])
+        elif modal == 't1ce':
+            self.modal_ind = np.array([1])
+        elif modal == 't1':
+            self.modal_ind = np.array([2])
+        elif modal == 't2':
+            self.modal_ind = np.array([3])
+        elif modal == 'all':
+            self.modal_ind = np.array([0,1,2,3])
+
+    def __getitem__(self, index):
+
+        volpath = self.volpaths[index]
+        name = self.names[index]
+        
+        x = np.load(volpath)
+        segpath = volpath.replace('vol', 'seg')
+        y = np.load(segpath)
+
+        # ====== 核心修改：动态 3D 转 2D 切片 (随机抽取一层) ======
+        z_dim = x.shape[2]
+        z_idx = np.random.randint(0, z_dim)
+        x = x[:, :, z_idx, :]               # [H, W, 4]
+        x = x.transpose(2, 0, 1)            # [4, H, W]
+        y = y[:, :, z_idx]                  # [H, W]
+
+        # ====== 终极补丁：将所有切片统一垫黑边，补齐到 240x240 ======
+        H, W = y.shape
+        pad_H_top = max(0, (240 - H) // 2)
+        pad_H_bot = max(0, 240 - H - pad_H_top)
+        pad_W_left = max(0, (240 - W) // 2)
+        pad_W_right = max(0, 240 - W - pad_W_left)
+
+        x = np.pad(x, ((0, 0), (pad_H_top, pad_H_bot), (pad_W_left, pad_W_right)), mode='constant', constant_values=0)
+        y = np.pad(y, ((pad_H_top, pad_H_bot), (pad_W_left, pad_W_right)), mode='constant', constant_values=0)
+        # ==========================================================
+
+        
+
+
+        # BraTS often uses label 4; map to 3 for 4-class training
+        if self.num_cls == 4:
+            y = np.asarray(y)
+            y[y == 4] = 3
+        x, y = x[None, ...], y[None, ...]
+
+        x, y = self.transforms([x, y])
+
+        # remove batch dim added above
+        x = np.squeeze(x, axis=0)  # [4, H, W]
+        y = np.squeeze(y, axis=0)  # [H, W]
+
+        H, W = y.shape
+        y_flat = y.reshape(-1)
+        one_hot_targets = np.eye(self.num_cls)[y_flat]
+        yo = one_hot_targets.reshape(H, W, -1).transpose(2, 0, 1)  # [num_cls, H, W]
+
+        # select modalities
+        x = x[self.modal_ind, :, :]  # [len(modal_ind), H, W]
+
+        x = torch.from_numpy(np.ascontiguousarray(x))
+        yo = torch.from_numpy(np.ascontiguousarray(yo))
+
+        mask_idx = np.random.choice(15, 1)
+        mask = torch.squeeze(torch.from_numpy(mask_array[mask_idx]), dim=0)
+        return x, yo, mask, name
+
+    def __len__(self):
+        return len(self.volpaths)
+
+class Brats_loadall_test_nii(Dataset):
+    def __init__(self, transforms='', root=None, modal='all', test_file='test.txt'):
+        data_file_path = os.path.join(root, test_file)
+        with open(data_file_path, 'r') as f:
+            datalist = [i.strip() for i in f.readlines()]
+        datalist.sort()
+        volpaths = []
+        for dataname in datalist:
+            volpaths.append(os.path.join(root, 'vol', dataname+'_vol.npy'))
+        self.volpaths = volpaths
+        self.transforms = eval(transforms or 'Identity()')
+        self.names = datalist
+        self.num_cls = 4
+        if modal == 'flair':
+            self.modal_ind = np.array([0])
+        elif modal == 't1ce':
+            self.modal_ind = np.array([1])
+        elif modal == 't1':
+            self.modal_ind = np.array([2])
+        elif modal == 't2':
+            self.modal_ind = np.array([3])
+        elif modal == 'all':
+            self.modal_ind = np.array([0,1,2,3])
+
+    def __getitem__(self, index):
+
+        volpath = self.volpaths[index]
+        name = self.names[index]
+
+        x = np.load(volpath)  
+        segpath = volpath.replace('vol', 'seg')
+        y = np.load(segpath).astype(np.uint8)  
+
+        # ====== 核心修改：动态 3D 转 2D 切片 (随机抽取一层) ======
+        z_dim = x.shape[2]
+        z_idx = np.random.randint(0, z_dim)
+        x = x[:, :, z_idx, :]               # [H, W, 4]
+        x = x.transpose(2, 0, 1)            # [4, H, W]
+        y = y[:, :, z_idx]                  # [H, W]
+
+        # ====== 终极补丁：将所有切片统一垫黑边，补齐到 240x240 ======
+        H, W = y.shape
+        pad_H_top = max(0, (240 - H) // 2)
+        pad_H_bot = max(0, 240 - H - pad_H_top)
+        pad_W_left = max(0, (240 - W) // 2)
+        pad_W_right = max(0, 240 - W - pad_W_left)
+
+        x = np.pad(x, ((0, 0), (pad_H_top, pad_H_bot), (pad_W_left, pad_W_right)), mode='constant', constant_values=0)
+        y = np.pad(y, ((pad_H_top, pad_H_bot), (pad_W_left, pad_W_right)), mode='constant', constant_values=0)
+        # ==========================================================
+
+        if self.num_cls == 4:
+            y = np.asarray(y)
+            y[y == 4] = 3
+        x, y = x[None, ...], y[None, ...]
+        x, y = self.transforms([x, y])
+
+        x = np.squeeze(x, axis=0)  # [4, H, W]
+        y = np.squeeze(y, axis=0)  # [H, W]
+
+        x = x[self.modal_ind, :, :]  # [len(modal_ind), H, W]
+        x = torch.from_numpy(np.ascontiguousarray(x))
+        y = torch.from_numpy(np.ascontiguousarray(y))
+
+        return x, y, name
+
+    def __len__(self):
+        return len(self.volpaths)
+
+class Brats_loadall_val_nii(Dataset):
+    def __init__(self, transforms='', root=None, settype='train', modal='all'):
+        data_file_path = os.path.join(root, 'val.txt')
+        with open(data_file_path, 'r') as f:
+            datalist = [i.strip() for i in f.readlines()]
+        datalist.sort()
+        volpaths = []
+        for dataname in datalist:
+            volpaths.append(os.path.join(root, 'vol', dataname+'_vol.npy'))
+        self.volpaths = volpaths
+        self.transforms = eval(transforms or 'Identity()')
+        self.names = datalist
+        self.num_cls = 4
+        if modal == 'flair':
+            self.modal_ind = np.array([0])
+        elif modal == 't1ce':
+            self.modal_ind = np.array([1])
+        elif modal == 't1':
+            self.modal_ind = np.array([2])
+        elif modal == 't2':
+            self.modal_ind = np.array([3])
+        elif modal == 'all':
+            self.modal_ind = np.array([0,1,2,3])
+
+    def __getitem__(self, index):
+
+        volpath = self.volpaths[index]
+        name = self.names[index]
+
+        x = np.load(volpath)  
+        segpath = volpath.replace('vol', 'seg')
+        y = np.load(segpath).astype(np.uint8)  
+
+        # ====== 核心修改：动态 3D 转 2D 切片 (随机抽取一层) ======
+        z_dim = x.shape[2]
+        z_idx = np.random.randint(0, z_dim)
+        x = x[:, :, z_idx, :]               # [H, W, 4]
+        x = x.transpose(2, 0, 1)            # [4, H, W]
+        y = y[:, :, z_idx]                  # [H, W]
+
+        # ====== 终极补丁：将所有切片统一垫黑边，补齐到 240x240 ======
+        H, W = y.shape
+        pad_H_top = max(0, (240 - H) // 2)
+        pad_H_bot = max(0, 240 - H - pad_H_top)
+        pad_W_left = max(0, (240 - W) // 2)
+        pad_W_right = max(0, 240 - W - pad_W_left)
+
+        x = np.pad(x, ((0, 0), (pad_H_top, pad_H_bot), (pad_W_left, pad_W_right)), mode='constant', constant_values=0)
+        y = np.pad(y, ((pad_H_top, pad_H_bot), (pad_W_left, pad_W_right)), mode='constant', constant_values=0)
+        # ==========================================================
+
+        if self.num_cls == 4:
+            y = np.asarray(y)
+            y[y == 4] = 3
+        x, y = x[None, ...], y[None, ...]
+        x, y = self.transforms([x, y])
+
+        x = np.squeeze(x, axis=0)  # [4, H, W]
+        y = np.squeeze(y, axis=0)  # [H, W]
+
+        x = x[self.modal_ind, :, :]  # [len(modal_ind), H, W]
+
+        x = torch.from_numpy(np.ascontiguousarray(x))
+        y = torch.from_numpy(np.ascontiguousarray(y))
+
+        mask = mask_array[index % 15]
+        mask = torch.from_numpy(mask)
+        return x, y, mask, name
+
+    def __len__(self):
+        return len(self.volpaths)
